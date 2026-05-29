@@ -150,16 +150,20 @@ Episode pixels are **upweighted 7× in the loss function**.
 
 ## 📉 Loss Function
 
-$$\mathcal{L} = \text{RMSE}_{\log z} + 0.30 \cdot \text{SMAPE} + 0.15 \cdot (1 - \rho) + 7.0 \times \text{MSE}_{\text{episode}}$$
+$$L = \text{RMSE}_{\log z} + 0.30 \cdot \text{SMAPE} + 0.15 \cdot (1 - \rho) + 7.0 \times \text{MSE}_{\text{ep}}$$
+
+where $\rho$ is Pearson correlation and episode pixels are upweighted **7×**.
+
+### Loss Terms
 
 | Term | Weight | Purpose |
 |---|---|---|
-| RMSE_logz | 0.55 | Primary reconstruction in log space |
-| SMAPE | 0.30 | Scale-invariant percentage error |
-| 1 − ρ | 0.15 | Pearson correlation — preserves spatial pollution patterns |
-| MSE_episode | 7.0× | Heavy focus on extreme pollution events |
+| $\text{RMSE}_{\log z}$ | 1.0 | Primary reconstruction in log space |
+| $\text{SMAPE}$ | 0.30 | Scale-invariant % error |
+| $1 - \rho$ | 0.15 | Preserves spatial pollution patterns |
+| $\text{MSE}_{\text{ep}}$ | 7.0× | Upweights extreme pollution events |
 
----
+--
 
 ## 📊 Results
 
