@@ -1,0 +1,1267 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "d14fe10c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:15:49.562383Z",
+     "iopub.status.busy": "2026-04-04T06:15:49.562143Z",
+     "iopub.status.idle": "2026-04-04T06:15:57.976504Z",
+     "shell.execute_reply": "2026-04-04T06:15:57.975606Z"
+    },
+    "papermill": {
+     "duration": 8.419814,
+     "end_time": "2026-04-04T06:15:57.978128+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:15:49.558314+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "PyTorch  : 2.10.0+cu128\n",
+      "Device   : cuda\n",
+      "GPU      : Tesla T4\n",
+      "Capability: sm_75\n",
+      "AMP      : True\n",
+      "Effective batch: 4\n"
+     ]
+    }
+   ],
+   "source": [
+    "import numpy as np\n",
+    "import os\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.nn.functional as F\n",
+    "from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler\n",
+    "from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR\n",
+    "from torch.cuda.amp import autocast, GradScaler\n",
+    "from scipy.ndimage import uniform_filter1d\n",
+    "from tqdm import tqdm\n",
+    "import warnings, gc, time\n",
+    "warnings.filterwarnings('ignore')\n",
+    "\n",
+    "DATA_ROOT = '/kaggle/input/competitions/anrf-aise-hack-phase-2-theme-2-pollution-forecasting-iitd/aisehack-theme-2'\n",
+    "TEST_IN   = f'{DATA_ROOT}/test_in'\n",
+    "OUTPUT    = '/kaggle/working/preds.npy'\n",
+    "\n",
+    "# ── Hyperparams ────────────────────────────────────────────────────────────────\n",
+    "BATCH_SIZE  = 2      # was 2 — T4 16GB easily handles B=4\n",
+    "ACCUM_STEPS = 2      # effective batch = 8\n",
+    "EPOCHS      = 20     # was 12-15 — AMP makes each epoch ~25min so 20 fits in 12h\n",
+    "LR          = 3e-4\n",
+    "HIDDEN_DIM  = 96\n",
+    "KERNEL_SIZE = 3\n",
+    "NUM_LAYERS  = 3\n",
+    "HISTORY_PM  = 10\n",
+    "FORECAST    = 16\n",
+    "H, W        = 140, 124\n",
+    "PATIENCE    = 5      # more patience since we have more epochs\n",
+    "\n",
+    "DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+    "print(f'PyTorch  : {torch.__version__}')\n",
+    "print(f'Device   : {DEVICE}')\n",
+    "if torch.cuda.is_available():\n",
+    "    print(f'GPU      : {torch.cuda.get_device_name(0)}')\n",
+    "    cap = torch.cuda.get_device_capability(0)\n",
+    "    print(f'Capability: sm_{cap[0]}{cap[1]}')\n",
+    "    USE_AMP = cap[0] >= 7   # T4=sm_75 → True\n",
+    "    torch.backends.cudnn.benchmark = True\n",
+    "else:\n",
+    "    USE_AMP = False\n",
+    "print(f'AMP      : {USE_AMP}')\n",
+    "print(f'Effective batch: {BATCH_SIZE * ACCUM_STEPS}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "616d8ca7",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:15:57.984111Z",
+     "iopub.status.busy": "2026-04-04T06:15:57.983770Z",
+     "iopub.status.idle": "2026-04-04T06:16:30.055460Z",
+     "shell.execute_reply": "2026-04-04T06:16:30.054468Z"
+    },
+    "papermill": {
+     "duration": 32.076385,
+     "end_time": "2026-04-04T06:16:30.057108+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:15:57.980723+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Loading APRIL_16...\n",
+      "Loading JULY_16...\n",
+      "Loading OCT_16...\n",
+      "Loading DEC_16...\n",
+      "Computing normalization stats...\n",
+      "  cpm25: mean=23.4329, std=1.3375\n",
+      "  q2: mean=0.0115, std=0.0070\n",
+      "  t2: mean=291.5939, std=14.0668\n",
+      "  u10: mean=1.5476, std=3.5471\n",
+      "  v10: mean=0.1373, std=2.9958\n",
+      "  swdown: mean=221.7803, std=309.4066\n",
+      "  pblh: mean=764.2910, std=636.3438\n",
+      "  psfc: mean=87986.8594, std=17645.7559\n",
+      "  rain: mean=0.0948, std=1.0707\n",
+      "  PM25: mean=0.0254, std=0.0972\n",
+      "  NH3: mean=0.0284, std=0.0470\n",
+      "  SO2: mean=0.0195, std=0.1225\n",
+      "  NOx: mean=0.0297, std=0.1088\n",
+      "  NMVOC_e: mean=0.0417, std=0.0938\n",
+      "  NMVOC_finn: mean=0.0276, std=0.2897\n",
+      "  bio: mean=0.0386, std=0.1344\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Feature lists & Data Loading ───────────────────────────────────────────────\n",
+    "MET_VARS      = ['q2', 't2', 'u10', 'v10', 'swdown', 'pblh', 'psfc', 'rain']\n",
+    "EMISSION_VARS = ['PM25', 'NH3', 'SO2', 'NOx', 'NMVOC_e', 'NMVOC_finn', 'bio']\n",
+    "MONTHS        = ['APRIL_16', 'JULY_16', 'OCT_16', 'DEC_16']\n",
+    "LOG_FEATURES  = {'PM25', 'NH3', 'SO2', 'NOx', 'NMVOC_e', 'NMVOC_finn', 'bio', 'cpm25'}\n",
+    "\n",
+    "def load_month(month):\n",
+    "    path = os.path.join(DATA_ROOT, 'raw', month)\n",
+    "    data = {'cpm25': np.load(os.path.join(path, 'cpm25.npy')).astype(np.float32)}\n",
+    "    for v in MET_VARS + EMISSION_VARS:\n",
+    "        fpath = os.path.join(path, f'{v}.npy')\n",
+    "        if os.path.exists(fpath):\n",
+    "            data[v] = np.load(fpath).astype(np.float32)\n",
+    "    return data\n",
+    "\n",
+    "all_data = {}\n",
+    "for m in MONTHS:\n",
+    "    print(f'Loading {m}...')\n",
+    "    all_data[m] = load_month(m)\n",
+    "\n",
+    "# ── Normalization ──────────────────────────────────────────────────────────────\n",
+    "def compute_stats(key):\n",
+    "    arrays   = [d[key] for d in all_data.values() if key in d]\n",
+    "    combined = np.concatenate(arrays, axis=0).astype(np.float32)\n",
+    "    if key in LOG_FEATURES:\n",
+    "        combined = np.log1p(combined * 1e9)\n",
+    "    return float(combined.mean()), float(combined.std() + 1e-8)\n",
+    "\n",
+    "print('Computing normalization stats...')\n",
+    "norm_stats = {}\n",
+    "for key in ['cpm25'] + MET_VARS + EMISSION_VARS:\n",
+    "    try:\n",
+    "        norm_stats[key] = compute_stats(key)\n",
+    "        print(f'  {key}: mean={norm_stats[key][0]:.4f}, std={norm_stats[key][1]:.4f}')\n",
+    "    except Exception as e:\n",
+    "        print(f'  {key}: SKIPPED ({e})')\n",
+    "\n",
+    "def normalize(arr, key):\n",
+    "    mean, std = norm_stats[key]\n",
+    "    arr = arr.astype(np.float32)\n",
+    "    if key in LOG_FEATURES:\n",
+    "        arr = np.log1p(arr * 1e9)\n",
+    "    return (arr - mean) / std\n",
+    "\n",
+    "def denormalize_pm25(arr_norm):\n",
+    "    mean, std = norm_stats['cpm25']\n",
+    "    return np.expm1(arr_norm * std + mean) / 1e9"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "b22a7b75",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:16:30.064573Z",
+     "iopub.status.busy": "2026-04-04T06:16:30.064319Z",
+     "iopub.status.idle": "2026-04-04T06:16:31.734862Z",
+     "shell.execute_reply": "2026-04-04T06:16:31.733974Z"
+    },
+    "papermill": {
+     "duration": 1.676002,
+     "end_time": "2026-04-04T06:16:31.736369+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:16:30.060367+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Computing episode masks (vectorized)...\n",
+      "  APRIL_16... ep_frac=0.0099\n",
+      "  JULY_16... ep_frac=0.0093\n",
+      "  OCT_16... ep_frac=0.0085\n",
+      "  DEC_16... ep_frac=0.0102\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Fast Vectorized Episode Detection ──────────────────────────────────────────\n",
+    "def identify_episodes(pm_arr, seasonal_period=24):\n",
+    "    T, H, W   = pm_arr.shape\n",
+    "    pm_2d     = pm_arr.reshape(T, -1).astype(np.float64)\n",
+    "    trend     = uniform_filter1d(pm_2d, size=seasonal_period, axis=0)\n",
+    "    detrended = pm_2d - trend\n",
+    "    seasonal  = np.zeros_like(detrended)\n",
+    "    for h in range(seasonal_period):\n",
+    "        idx = np.arange(h, T, seasonal_period)\n",
+    "        seasonal[idx] = detrended[idx].mean(axis=0, keepdims=True)\n",
+    "    residual = detrended - seasonal\n",
+    "    sigma    = residual.std(axis=0, keepdims=True) + 1e-8\n",
+    "    return (residual > 3 * sigma).reshape(T, H, W)\n",
+    "\n",
+    "print('Computing episode masks (vectorized)...')\n",
+    "episode_masks = {}\n",
+    "for m, d in all_data.items():\n",
+    "    print(f'  {m}...', end=' ', flush=True)\n",
+    "    episode_masks[m] = identify_episodes(d['cpm25'])\n",
+    "    print(f'ep_frac={episode_masks[m].mean():.4f}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "2a4cca58",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:16:31.743888Z",
+     "iopub.status.busy": "2026-04-04T06:16:31.743286Z",
+     "iopub.status.idle": "2026-04-04T06:16:38.495617Z",
+     "shell.execute_reply": "2026-04-04T06:16:38.494854Z"
+    },
+    "papermill": {
+     "duration": 6.757833,
+     "end_time": "2026-04-04T06:16:38.497323+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:16:31.739490+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train: 2245 samples (1122 batches)\n",
+      "Val:   245 samples (123 batches)  [stride=2, saves ~7min/epoch]\n",
+      "Weight range: 1.01 – 1.34\n",
+      "Met channels: 15\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Dataset ─────────────────────────────────────────────────────────────────────\n",
+    "class PM25Dataset(Dataset):\n",
+    "    def __init__(self, data_dict, ep_masks, stride=1):\n",
+    "        self.samples = []\n",
+    "        self.weights = []\n",
+    "        other_keys   = [k for k in MET_VARS + EMISSION_VARS if k in norm_stats]\n",
+    "        window       = HISTORY_PM + FORECAST\n",
+    "\n",
+    "        for month, data in data_dict.items():\n",
+    "            T       = data['cpm25'].shape[0]\n",
+    "            pm      = normalize(data['cpm25'], 'cpm25')\n",
+    "            mets    = np.stack([normalize(data[k], k) for k in other_keys if k in data], axis=1)\n",
+    "            ep_mask = ep_masks[month]\n",
+    "\n",
+    "            for t in range(0, T - window + 1, stride):\n",
+    "                pm_hist  = pm  [t           : t + HISTORY_PM]\n",
+    "                pm_fut   = pm  [t+HISTORY_PM : t + window]\n",
+    "                met_hist = mets[t           : t + HISTORY_PM]\n",
+    "                ep_frac  = ep_mask[t+HISTORY_PM : t+window].mean()\n",
+    "                self.samples.append((pm_hist, met_hist, pm_fut))\n",
+    "                self.weights.append(1.0 + 9.0 * ep_frac)\n",
+    "\n",
+    "        self.weights = np.array(self.weights, dtype=np.float32)\n",
+    "\n",
+    "    def __len__(self): return len(self.samples)\n",
+    "\n",
+    "    def __getitem__(self, idx):\n",
+    "        ph, mh, pf = self.samples[idx]\n",
+    "        return torch.tensor(ph), torch.tensor(mh), torch.tensor(pf)\n",
+    "\n",
+    "\n",
+    "# Train = first 80%, Val = last 20% of each month\n",
+    "train_data, val_data = {}, {}\n",
+    "train_ep,   val_ep   = {}, {}\n",
+    "for m, d in all_data.items():\n",
+    "    T     = d['cpm25'].shape[0]\n",
+    "    split = int(T * 0.8)\n",
+    "    train_data[m] = {k: v[:split] for k, v in d.items() if hasattr(v,'shape') and v.shape[0]==T}\n",
+    "    val_data  [m] = {k: v[split:] for k, v in d.items() if hasattr(v,'shape') and v.shape[0]==T}\n",
+    "    train_ep  [m] = episode_masks[m][:split]\n",
+    "    val_ep    [m] = episode_masks[m][split:]\n",
+    "\n",
+    "# stride=1 for train (all samples), stride=2 for val (halves val time: 13min→6min/epoch)\n",
+    "train_ds = PM25Dataset(train_data, train_ep, stride=1)\n",
+    "val_ds   = PM25Dataset(val_data,   val_ep,   stride=2)\n",
+    "\n",
+    "sampler  = WeightedRandomSampler(\n",
+    "    weights=torch.tensor(train_ds.weights),\n",
+    "    num_samples=len(train_ds), replacement=True\n",
+    ")\n",
+    "\n",
+    "train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,\n",
+    "                      num_workers=2, pin_memory=True, drop_last=True)\n",
+    "val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,\n",
+    "                      num_workers=2, pin_memory=True)\n",
+    "\n",
+    "print(f'Train: {len(train_ds)} samples ({len(train_dl)} batches)')\n",
+    "print(f'Val:   {len(val_ds)} samples ({len(val_dl)} batches)  [stride=2, saves ~7min/epoch]')\n",
+    "print(f'Weight range: {train_ds.weights.min():.2f} – {train_ds.weights.max():.2f}')\n",
+    "C_met = train_ds[0][1].shape[1]\n",
+    "print(f'Met channels: {C_met}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "8525d95c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:16:38.507036Z",
+     "iopub.status.busy": "2026-04-04T06:16:38.506643Z",
+     "iopub.status.idle": "2026-04-04T06:16:41.946734Z",
+     "shell.execute_reply": "2026-04-04T06:16:41.945909Z"
+    },
+    "papermill": {
+     "duration": 3.446446,
+     "end_time": "2026-04-04T06:16:41.948615+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:16:38.502169+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "DataParallel on 2 GPUs\n",
+      "Parameters: 3,829,605\n",
+      "Output shape: torch.Size([1, 16, 140, 124])  (expected (1,16,140,124))\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Model ──────────────────────────────────────────────────────────────────────\n",
+    "\n",
+    "class ConvLSTMCell(nn.Module):\n",
+    "    def __init__(self, in_ch, hidden_ch, kernel_size):\n",
+    "        super().__init__()\n",
+    "        self.hidden_ch = hidden_ch\n",
+    "        self.conv = nn.Conv2d(in_ch + hidden_ch, 4 * hidden_ch,\n",
+    "                              kernel_size, padding=kernel_size // 2)\n",
+    "        self.ln   = nn.GroupNorm(1, 4 * hidden_ch)\n",
+    "\n",
+    "    def forward(self, x, h, c):\n",
+    "        gates      = self.ln(self.conv(torch.cat([x, h], 1)))\n",
+    "        i, f, g, o = gates.chunk(4, 1)\n",
+    "        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)\n",
+    "        h = torch.sigmoid(o) * torch.tanh(c)\n",
+    "        return h, c\n",
+    "\n",
+    "    def init_hidden(self, B, H, W, device):\n",
+    "        return (torch.zeros(B, self.hidden_ch, H, W, device=device),\n",
+    "                torch.zeros(B, self.hidden_ch, H, W, device=device))\n",
+    "\n",
+    "\n",
+    "class SpatialAttention(nn.Module):\n",
+    "    def __init__(self, in_ch):\n",
+    "        super().__init__()\n",
+    "        self.conv = nn.Sequential(\n",
+    "            nn.Conv2d(in_ch, in_ch // 4, 1), nn.ReLU(),\n",
+    "            nn.Conv2d(in_ch // 4, 1, 1),     nn.Sigmoid()\n",
+    "        )\n",
+    "    def forward(self, x): return x * self.conv(x)\n",
+    "\n",
+    "\n",
+    "class WindWarp(nn.Module):\n",
+    "    \"\"\"Physics transport via last known wind. Scale decays with forecast step.\"\"\"\n",
+    "    def __init__(self, u_idx, v_idx):\n",
+    "        super().__init__()\n",
+    "        self.u_idx, self.v_idx = u_idx, v_idx\n",
+    "        # Learnable per-step scale — starts at 0.05, model adapts\n",
+    "        self.log_scale = nn.Parameter(torch.tensor(-3.0))  # exp(-3) ≈ 0.05\n",
+    "\n",
+    "    def forward(self, pm, last_met, step=0):\n",
+    "        if self.u_idx is None: return pm\n",
+    "        B, _, H, W = pm.shape\n",
+    "        scale = torch.exp(self.log_scale) / (1.0 + 0.1 * step)  # decay with step\n",
+    "        u  = last_met[:, self.u_idx:self.u_idx+1]\n",
+    "        v  = last_met[:, self.v_idx:self.v_idx+1]\n",
+    "        xs = torch.linspace(-1, 1, W, device=pm.device)\n",
+    "        ys = torch.linspace(-1, 1, H, device=pm.device)\n",
+    "        gy, gx   = torch.meshgrid(ys, xs, indexing='ij')\n",
+    "        grid     = torch.stack([gx, gy], -1).unsqueeze(0).expand(B, -1, -1, -1)\n",
+    "        flow     = torch.stack([u.squeeze(1), v.squeeze(1)], -1) * scale\n",
+    "        warped_g = (grid + flow).clamp(-1, 1)\n",
+    "        return F.grid_sample(pm, warped_g, align_corners=False,\n",
+    "                             mode='bilinear', padding_mode='border')\n",
+    "\n",
+    "\n",
+    "class SpatialEncoder(nn.Module):\n",
+    "    \"\"\"Multi-scale dilated conv for local + regional spatial patterns.\"\"\"\n",
+    "    def __init__(self, in_ch, out_ch):\n",
+    "        super().__init__()\n",
+    "        self.e1   = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1, dilation=1), nn.ReLU())\n",
+    "        self.e2   = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=2, dilation=2), nn.ReLU())\n",
+    "        self.e3   = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=4, dilation=4), nn.ReLU())\n",
+    "        self.fuse = nn.Conv2d(out_ch * 3, out_ch, 1)\n",
+    "    def forward(self, x):\n",
+    "        return self.fuse(torch.cat([self.e1(x), self.e2(x), self.e3(x)], 1))\n",
+    "\n",
+    "\n",
+    "class EpisodeDetector(nn.Module):\n",
+    "    \"\"\"Learns WHERE episodes occur from hidden state → soft map for decoder.\"\"\"\n",
+    "    def __init__(self, in_ch):\n",
+    "        super().__init__()\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.Conv2d(in_ch, 32, 3, padding=1), nn.ReLU(),\n",
+    "            nn.Conv2d(32, 16, 3, padding=1),    nn.ReLU(),\n",
+    "            nn.Conv2d(16, 1,  1),               nn.Sigmoid()\n",
+    "        )\n",
+    "    def forward(self, h): return self.net(h)\n",
+    "\n",
+    "\n",
+    "class Phase2Model(nn.Module):\n",
+    "    \"\"\"\n",
+    "    Autoregressive ConvLSTM encoder-decoder with:\n",
+    "    - WindWarp (learnable decay scale)\n",
+    "    - EpisodeDetector (soft episode map fed to decoder)\n",
+    "    - SpatialEncoder (multi-scale dilated)\n",
+    "    - SpatialAttention\n",
+    "    - Episode amplitude amplifier\n",
+    "    - Scheduled teacher forcing\n",
+    "    \"\"\"\n",
+    "    def __init__(self, met_channels, hidden_dim, kernel_size, num_layers, u_idx, v_idx):\n",
+    "        super().__init__()\n",
+    "        self.num_layers = num_layers\n",
+    "        enc_met_ch      = hidden_dim // 2\n",
+    "\n",
+    "        self.spatial_enc    = SpatialEncoder(met_channels, enc_met_ch)\n",
+    "        self.wind_warp      = WindWarp(u_idx, v_idx)\n",
+    "        self.episode_detect = EpisodeDetector(hidden_dim)\n",
+    "\n",
+    "        self.enc_cells = nn.ModuleList()\n",
+    "        self.dec_cells = nn.ModuleList()\n",
+    "        for i in range(num_layers):\n",
+    "            enc_in = (1 + enc_met_ch)     if i == 0 else hidden_dim\n",
+    "            dec_in = (1 + enc_met_ch + 1) if i == 0 else hidden_dim\n",
+    "            self.enc_cells.append(ConvLSTMCell(enc_in, hidden_dim, kernel_size))\n",
+    "            self.dec_cells.append(ConvLSTMCell(dec_in, hidden_dim, kernel_size))\n",
+    "\n",
+    "        self.attn        = SpatialAttention(hidden_dim)\n",
+    "        self.output_head = nn.Sequential(\n",
+    "            nn.Conv2d(hidden_dim, 64, 3, padding=1), nn.ReLU(),\n",
+    "            nn.Dropout2d(0.1),\n",
+    "            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),\n",
+    "            nn.Conv2d(32, 1, 1)\n",
+    "        )\n",
+    "        self.episode_amp = nn.Sequential(\n",
+    "            nn.Conv2d(hidden_dim, 32, 3, padding=1), nn.ReLU(),\n",
+    "            nn.Conv2d(32, 1, 1), nn.Softplus()\n",
+    "        )\n",
+    "\n",
+    "    def forward(self, pm_hist, met_hist, teacher_forcing_ratio=0.0, pm_fut_gt=None):\n",
+    "        \"\"\"\n",
+    "        pm_hist             : (B, 10, H, W)\n",
+    "        met_hist            : (B, 10, C, H, W)\n",
+    "        teacher_forcing_ratio: during training, use ground truth with this probability\n",
+    "        pm_fut_gt           : (B, 16, H, W) ground truth for teacher forcing\n",
+    "        \"\"\"\n",
+    "        B, T_hist, H, W = pm_hist.shape\n",
+    "        states = [cell.init_hidden(B, H, W, pm_hist.device) for cell in self.enc_cells]\n",
+    "\n",
+    "        # Encoder: process 10h history\n",
+    "        for t in range(T_hist):\n",
+    "            enc_met = self.spatial_enc(met_hist[:, t])\n",
+    "            x = torch.cat([pm_hist[:, t:t+1], enc_met], 1)\n",
+    "            for i, cell in enumerate(self.enc_cells):\n",
+    "                h, c = states[i]; h, c = cell(x, h, c); states[i] = (h, c); x = h\n",
+    "\n",
+    "        last_met  = met_hist[:, -1]\n",
+    "        enc_met_d = self.spatial_enc(last_met)  # pre-encode once\n",
+    "\n",
+    "        # Autoregressive decoder: predict 16 steps\n",
+    "        preds      = []\n",
+    "        prev_pm    = pm_hist[:, -1:].clone()\n",
+    "        dec_states = list(states)\n",
+    "\n",
+    "        for t in range(FORECAST):\n",
+    "            warped = self.wind_warp(prev_pm, last_met, step=t)\n",
+    "            h_cur  = dec_states[-1][0]\n",
+    "            ep_map = self.episode_detect(h_cur)\n",
+    "\n",
+    "            x = torch.cat([warped, enc_met_d, ep_map], 1)\n",
+    "            for i, cell in enumerate(self.dec_cells):\n",
+    "                h, c = dec_states[i]; h, c = cell(x, h, c); dec_states[i] = (h, c); x = h\n",
+    "\n",
+    "            x      = self.attn(x)\n",
+    "            delta  = self.output_head(x)\n",
+    "            amp    = self.episode_amp(x)\n",
+    "            pred_t = prev_pm + delta + ep_map * amp\n",
+    "            # Clip to prevent runaway autoregressive predictions\n",
+    "            pred_t = pred_t.clamp(-10, 30)\n",
+    "            preds.append(pred_t)\n",
+    "\n",
+    "            # Scheduled teacher forcing\n",
+    "            if teacher_forcing_ratio > 0.0 and pm_fut_gt is not None and torch.rand(1).item() < teacher_forcing_ratio:\n",
+    "                prev_pm = pm_fut_gt[:, t:t+1]\n",
+    "            else:\n",
+    "                prev_pm = pred_t\n",
+    "\n",
+    "        return torch.cat(preds, dim=1)  # (B, 16, H, W)\n",
+    "\n",
+    "\n",
+    "# Instantiate\n",
+    "other_keys = [k for k in MET_VARS + EMISSION_VARS if k in norm_stats]\n",
+    "u_idx      = other_keys.index('u10') if 'u10' in other_keys else None\n",
+    "v_idx      = other_keys.index('v10') if 'v10' in other_keys else None\n",
+    "\n",
+    "_model   = Phase2Model(C_met, HIDDEN_DIM, KERNEL_SIZE, NUM_LAYERS, u_idx, v_idx)\n",
+    "num_gpus = torch.cuda.device_count()\n",
+    "if num_gpus > 1:\n",
+    "    model = nn.DataParallel(_model, device_ids=list(range(num_gpus)))\n",
+    "    print(f'DataParallel on {num_gpus} GPUs')\n",
+    "else:\n",
+    "    model = _model\n",
+    "model = model.to(DEVICE)\n",
+    "\n",
+    "n_params = sum(p.numel() for p in _model.parameters() if p.requires_grad)\n",
+    "print(f'Parameters: {n_params:,}')\n",
+    "\n",
+    "# Quick shape test\n",
+    "with torch.no_grad():\n",
+    "    dp = torch.zeros(1, HISTORY_PM, H, W).to(DEVICE)\n",
+    "    dm = torch.zeros(1, HISTORY_PM, C_met, H, W).to(DEVICE)\n",
+    "    print(f'Output shape: {model(dp, dm).shape}  (expected (1,16,140,124))')\n",
+    "del dp, dm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "c01131d4",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:16:41.957686Z",
+     "iopub.status.busy": "2026-04-04T06:16:41.957407Z",
+     "iopub.status.idle": "2026-04-04T06:16:42.080392Z",
+     "shell.execute_reply": "2026-04-04T06:16:42.079537Z"
+    },
+    "papermill": {
+     "duration": 0.129645,
+     "end_time": "2026-04-04T06:16:42.082172+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:16:41.952527+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Perfect-prediction loss: 0.150000  (should be ~0)\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Loss Functions ─────────────────────────────────────────────────────────────\n",
+    "\n",
+    "def smape_loss(pred, target):\n",
+    "    return (pred - target).abs().div(0.5 * (pred.abs() + target.abs()) + 1e-8).mean()\n",
+    "\n",
+    "def episode_weighted_loss(pred, target, pm_hist):\n",
+    "    hist_mean = pm_hist.mean(dim=1, keepdim=True)\n",
+    "    hist_std  = pm_hist.std(dim=1,  keepdim=True) + 1e-8\n",
+    "    weights   = 1.0 + 2.0 * ((target - hist_mean.expand_as(target)) /\n",
+    "                               hist_std.expand_as(target)).clamp(0).detach()\n",
+    "    return smape_loss(pred * weights, target * weights)\n",
+    "\n",
+    "def spatial_gradient_loss(pred, target):\n",
+    "    def grad(x):\n",
+    "        return x[:,:,:,1:] - x[:,:,:,:-1], x[:,:,1:,:] - x[:,:,:-1,:]\n",
+    "    pdx, pdy = grad(pred)\n",
+    "    tdx, tdy = grad(target)\n",
+    "    return F.mse_loss(pdx, tdx) + F.mse_loss(pdy, tdy)\n",
+    "\n",
+    "def pearson_corr_loss(pred, target):\n",
+    "    \"\"\"\n",
+    "    NEW: Directly optimises EpisodeCorr metric.\n",
+    "    Pearson correlation averaged over batch.\n",
+    "    Returns 1 - corr (so minimising → maximising correlation).\n",
+    "    \"\"\"\n",
+    "    B = pred.shape[0]\n",
+    "    p = pred.view(B, -1)\n",
+    "    t = target.view(B, -1)\n",
+    "    pm = p - p.mean(dim=1, keepdim=True)\n",
+    "    tm = t - t.mean(dim=1, keepdim=True)\n",
+    "    corr = (pm * tm).sum(dim=1) / (\n",
+    "        torch.sqrt((pm**2).sum(dim=1) * (tm**2).sum(dim=1)) + 1e-8)\n",
+    "    return (1.0 - corr.mean())\n",
+    "\n",
+    "def combined_loss(pred, target, pm_hist, alpha=0.5, beta=0.25, gamma=0.1, delta=0.15):\n",
+    "    \"\"\"\n",
+    "    50% episode-weighted SMAPE  → EpisodeSMAPE + GlobalSMAPE\n",
+    "    25% plain SMAPE             → global coverage\n",
+    "    10% spatial gradient        → sharp patterns for EpisodeCorr\n",
+    "    15% Pearson correlation     → directly optimise EpisodeCorr metric (NEW)\n",
+    "    \"\"\"\n",
+    "    return (alpha * episode_weighted_loss(pred, target, pm_hist) +\n",
+    "            beta  * smape_loss(pred, target) +\n",
+    "            gamma * spatial_gradient_loss(pred, target) +\n",
+    "            delta * pearson_corr_loss(pred, target))\n",
+    "\n",
+    "# Sanity check\n",
+    "with torch.no_grad():\n",
+    "    p = torch.ones(2, FORECAST, H, W)\n",
+    "    h = torch.ones(2, HISTORY_PM, H, W)\n",
+    "    l = combined_loss(p, p, h)\n",
+    "    print(f'Perfect-prediction loss: {l.item():.6f}  (should be ~0)')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "0b7a36f4",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T06:16:42.091733Z",
+     "iopub.status.busy": "2026-04-04T06:16:42.091440Z",
+     "iopub.status.idle": "2026-04-04T16:36:23.993468Z",
+     "shell.execute_reply": "2026-04-04T16:36:23.992396Z"
+    },
+    "papermill": {
+     "duration": 37181.90899,
+     "end_time": "2026-04-04T16:36:23.995249+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T06:16:42.086259+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Training: 20 epochs | batch=2 (eff=4) | AMP=True\n",
+      "  Ep    Train      Val        LR    TF    Time\n",
+      "----------------------------------------------------\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   1   0.2006   0.3537  1.20e-04  0.47   31.5m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   2   0.1675   0.3190  2.10e-04  0.45   30.8m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   3   0.1529   0.2787  3.00e-04  0.42   30.8m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   4   0.1466   0.2664  2.98e-04  0.40   30.7m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   5   0.1428   0.2672  2.90e-04  0.38   30.8m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   6   0.1391   0.2723  2.78e-04  0.35   30.7m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   7   0.1417   0.2454  2.62e-04  0.33   30.8m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   8   0.1420   0.2531  2.42e-04  0.30   31.1m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "   9   0.1433   0.2343  2.20e-04  0.28   31.0m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  10   0.1432   0.2325  1.95e-04  0.25   31.1m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  11   0.1465   0.2320  1.68e-04  0.22   30.9m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  12   0.1515   0.2352  1.42e-04  0.20   31.0m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  13   0.1538   0.2597  1.15e-04  0.17   30.9m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  14   0.1569   0.2212  9.04e-05  0.15   30.9m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  15   0.1592   0.2180  6.76e-05  0.12   31.0m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  16   0.1640   0.2202  4.78e-05  0.10   31.0m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  17   0.1666   0.2218  3.17e-05  0.08   31.0m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  18   0.1712   0.2179  1.98e-05  0.05   31.2m ✓\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 \r"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  19   0.1775   0.2186  1.25e-05  0.03   31.3m\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "                                                 "
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  20   0.1824   0.2179  1.00e-05  0.00   31.2m ✓\n",
+      "\n",
+      "Best val loss: 0.2179 | Total training: 10.33h\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\r"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Optimizer, Scheduler, AMP Scaler ──────────────────────────────────────────\n",
+    "optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)\n",
+    "warmup    = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=3)\n",
+    "cosine    = CosineAnnealingLR(optimizer, T_max=max(EPOCHS - 3, 1), eta_min=1e-5)\n",
+    "scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])\n",
+    "scaler    = GradScaler(enabled=USE_AMP)\n",
+    "CKPT      = '/kaggle/working/best_model_p2.pt'\n",
+    "\n",
+    "\n",
+    "def get_tf_ratio(epoch, total_epochs, start=0.5, end=0.0):\n",
+    "    \"\"\"Teacher forcing ratio decays linearly from start→end over training.\"\"\"\n",
+    "    progress = min(epoch / total_epochs, 1.0)\n",
+    "    return start * (1.0 - progress) + end * progress\n",
+    "\n",
+    "\n",
+    "def run_epoch(dl, train=True, tf_ratio=0.0):\n",
+    "    model.train() if train else model.eval()\n",
+    "    total_loss = 0.0\n",
+    "    ctx = torch.enable_grad() if train else torch.no_grad()\n",
+    "    with ctx:\n",
+    "        if train: optimizer.zero_grad()\n",
+    "        for step, (pm_hist, met_hist, pm_fut) in enumerate(tqdm(dl, leave=False)):\n",
+    "            pm_hist  = pm_hist .to(DEVICE, non_blocking=True)\n",
+    "            met_hist = met_hist.to(DEVICE, non_blocking=True)\n",
+    "            pm_fut   = pm_fut  .to(DEVICE, non_blocking=True)\n",
+    "\n",
+    "            with autocast(enabled=USE_AMP):\n",
+    "                # Pass teacher forcing info during training\n",
+    "                if train and tf_ratio > 0:\n",
+    "                    pred = model(pm_hist, met_hist,\n",
+    "                                 teacher_forcing_ratio=tf_ratio,\n",
+    "                                 pm_fut_gt=pm_fut)\n",
+    "                else:\n",
+    "                    pred = model(pm_hist, met_hist)\n",
+    "                loss = combined_loss(pred, pm_fut, pm_hist)\n",
+    "\n",
+    "            if train:\n",
+    "                scaler.scale(loss / ACCUM_STEPS).backward()\n",
+    "                if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(dl):\n",
+    "                    scaler.unscale_(optimizer)\n",
+    "                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n",
+    "                    scaler.step(optimizer)\n",
+    "                    scaler.update()\n",
+    "                    optimizer.zero_grad()\n",
+    "\n",
+    "            total_loss += loss.item()\n",
+    "    return total_loss / len(dl)\n",
+    "\n",
+    "\n",
+    "# ── Training Loop ──────────────────────────────────────────────────────────────\n",
+    "best_val   = float('inf')\n",
+    "patience_c = 0\n",
+    "t_start    = time.time()\n",
+    "\n",
+    "print(f'Training: {EPOCHS} epochs | batch={BATCH_SIZE} (eff={BATCH_SIZE*ACCUM_STEPS}) | AMP={USE_AMP}')\n",
+    "print(f'{\"Ep\":>4} {\"Train\":>8} {\"Val\":>8} {\"LR\":>9} {\"TF\":>5} {\"Time\":>7}')\n",
+    "print('-' * 52)\n",
+    "\n",
+    "for epoch in range(1, EPOCHS + 1):\n",
+    "    tf = get_tf_ratio(epoch, EPOCHS, start=0.5, end=0.0)\n",
+    "    t0 = time.time()\n",
+    "\n",
+    "    train_loss = run_epoch(train_dl, train=True,  tf_ratio=tf)\n",
+    "    val_loss   = run_epoch(val_dl,   train=False, tf_ratio=0.0)\n",
+    "    scheduler.step()\n",
+    "    lr  = scheduler.get_last_lr()[0]\n",
+    "    dur = (time.time() - t0) / 60\n",
+    "\n",
+    "    tag = ''\n",
+    "    if val_loss < best_val:\n",
+    "        best_val   = val_loss\n",
+    "        patience_c = 0\n",
+    "        state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()\n",
+    "        torch.save(state, CKPT)\n",
+    "        tag = ' ✓'\n",
+    "    else:\n",
+    "        patience_c += 1\n",
+    "\n",
+    "    elapsed_h = (time.time() - t_start) / 3600\n",
+    "    print(f'{epoch:>4d} {train_loss:>8.4f} {val_loss:>8.4f} {lr:>9.2e} {tf:>5.2f} {dur:>6.1f}m{tag}')\n",
+    "\n",
+    "    # Safety: stop if we're close to 11h (leave 1h buffer for inference)\n",
+    "    if elapsed_h > 11.0:\n",
+    "        print(f'Time limit approaching ({elapsed_h:.1f}h). Stopping training.')\n",
+    "        break\n",
+    "\n",
+    "    if patience_c >= PATIENCE:\n",
+    "        print(f'Early stopping at epoch {epoch} (patience={PATIENCE})')\n",
+    "        break\n",
+    "\n",
+    "print(f'\\nBest val loss: {best_val:.4f} | Total training: {(time.time()-t_start)/3600:.2f}h')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "93e2989a",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T16:36:26.186743Z",
+     "iopub.status.busy": "2026-04-04T16:36:26.186089Z",
+     "iopub.status.idle": "2026-04-04T16:38:10.184884Z",
+     "shell.execute_reply": "2026-04-04T16:38:10.183961Z"
+    },
+    "papermill": {
+     "duration": 105.043628,
+     "end_time": "2026-04-04T16:38:10.186605+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T16:36:25.142977+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Best model loaded for inference.\n",
+      "Test samples: 218\n",
+      "Available test met: 15 keys\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Inference: 100%|██████████| 28/28 [01:38<00:00,  3.52s/it]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Saved: /kaggle/working/preds.npy\n",
+      "Shape: (218, 140, 124, 16) | min=0.0045 max=500.00 mean=35.31\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Inference ──────────────────────────────────────────────────────────────────\n",
+    "gc.collect()\n",
+    "if torch.cuda.is_available(): torch.cuda.empty_cache()\n",
+    "\n",
+    "_model_inf = Phase2Model(C_met, HIDDEN_DIM, KERNEL_SIZE, NUM_LAYERS, u_idx, v_idx)\n",
+    "_model_inf.load_state_dict(torch.load(CKPT, map_location=DEVICE))\n",
+    "_model_inf = _model_inf.to(DEVICE).eval()\n",
+    "print('Best model loaded for inference.')\n",
+    "\n",
+    "# Load test PM2.5\n",
+    "test_pm25_raw  = np.load(os.path.join(TEST_IN, 'cpm25.npy')).astype(np.float32)\n",
+    "N              = test_pm25_raw.shape[0]\n",
+    "print(f'Test samples: {N}')  # 218\n",
+    "test_pm25_norm = normalize(test_pm25_raw, 'cpm25')\n",
+    "del test_pm25_raw; gc.collect()\n",
+    "\n",
+    "avail_keys = [k for k in other_keys if os.path.exists(os.path.join(TEST_IN, f'{k}.npy'))]\n",
+    "print(f'Available test met: {len(avail_keys)} keys')\n",
+    "\n",
+    "all_preds   = []\n",
+    "INFER_BATCH = 8  # larger batch for faster inference\n",
+    "mean_pm, std_pm = norm_stats['cpm25']\n",
+    "\n",
+    "with torch.no_grad():\n",
+    "    for i in tqdm(range(0, N, INFER_BATCH), desc='Inference'):\n",
+    "        batch_mets = []\n",
+    "        for k in avail_keys:\n",
+    "            arr = np.load(os.path.join(TEST_IN, f'{k}.npy'), mmap_mode='r')\n",
+    "            slc = np.array(arr[i:i+INFER_BATCH]).astype(np.float32)\n",
+    "            batch_mets.append(normalize(slc, k))\n",
+    "\n",
+    "        met_b = torch.tensor(np.stack(batch_mets, axis=2)).to(DEVICE)\n",
+    "        pm_b  = torch.tensor(test_pm25_norm[i:i+INFER_BATCH]).to(DEVICE)\n",
+    "\n",
+    "        with autocast(enabled=USE_AMP):\n",
+    "            pred_norm = _model_inf(pm_b, met_b).cpu().float().numpy()\n",
+    "\n",
+    "        pred = np.clip(np.expm1(pred_norm * std_pm + mean_pm) / 1e9, 0, 500)\n",
+    "        all_preds.append(pred)\n",
+    "        del pm_b, met_b, batch_mets\n",
+    "        if torch.cuda.is_available(): torch.cuda.empty_cache()\n",
+    "\n",
+    "preds     = np.concatenate(all_preds, axis=0)  # (218, 16, H, W)\n",
+    "preds_out = preds.transpose(0, 2, 3, 1)        # (218, 140, 124, 16)\n",
+    "\n",
+    "assert preds_out.shape == (N, 140, 124, 16), f'Shape mismatch: {preds_out.shape}'\n",
+    "np.save(OUTPUT, preds_out)\n",
+    "print(f'Saved: {OUTPUT}')\n",
+    "print(f'Shape: {preds_out.shape} | min={preds_out.min():.4f} max={preds_out.max():.2f} mean={preds_out.mean():.2f}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "ec30aa9d",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-04-04T16:38:12.187444Z",
+     "iopub.status.busy": "2026-04-04T16:38:12.186623Z",
+     "iopub.status.idle": "2026-04-04T16:38:12.573151Z",
+     "shell.execute_reply": "2026-04-04T16:38:12.572245Z"
+    },
+    "papermill": {
+     "duration": 1.325571,
+     "end_time": "2026-04-04T16:38:12.574663+00:00",
+     "exception": false,
+     "start_time": "2026-04-04T16:38:11.249092+00:00",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "=============================================\n",
+      "SUBMISSION VERIFICATION\n",
+      "=============================================\n",
+      "  Path  : /kaggle/working/preds.npy\n",
+      "  Shape : (218, 140, 124, 16)\n",
+      "  H×W   : 140×124  ✓\n",
+      "  T_out : 16  ✓\n",
+      "  dtype : float32\n",
+      "  NaN   : False\n",
+      "  Min/Max: 0.0045 / 500.00\n",
+      "=============================================\n",
+      "✅ Ready to submit!\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ── Submission Verification ────────────────────────────────────────────────────\n",
+    "loaded  = np.load(OUTPUT)\n",
+    "N, H2, W2, T = loaded.shape\n",
+    "print('=' * 45)\n",
+    "print('SUBMISSION VERIFICATION')\n",
+    "print('=' * 45)\n",
+    "print(f'  Path  : {OUTPUT}')\n",
+    "print(f'  Shape : {loaded.shape}')\n",
+    "print(f'  H×W   : {H2}×{W2}  {\"✓\" if H2==140 and W2==124 else \"✗ WRONG\"}')\n",
+    "print(f'  T_out : {T}  {\"✓\" if T==16 else \"✗ WRONG\"}')\n",
+    "print(f'  dtype : {loaded.dtype}')\n",
+    "print(f'  NaN   : {np.isnan(loaded).any()}')\n",
+    "print(f'  Min/Max: {loaded.min():.4f} / {loaded.max():.2f}')\n",
+    "print('=' * 45)\n",
+    "if H2==140 and W2==124 and T==16 and not np.isnan(loaded).any():\n",
+    "    print('✅ Ready to submit!')\n",
+    "else:\n",
+    "    print('❌ Something wrong — do NOT submit.')"
+   ]
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "nvidiaTeslaT4",
+   "dataSources": [
+    {
+     "databundleVersionId": 16347663,
+     "sourceId": 135451,
+     "sourceType": "competition"
+    }
+   ],
+   "dockerImageVersionId": 31329,
+   "isGpuEnabled": true,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.12"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 37352.430407,
+   "end_time": "2026-04-04T16:38:18.586874+00:00",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2026-04-04T06:15:46.156467+00:00",
+   "version": "2.7.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
